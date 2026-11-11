@@ -30,6 +30,8 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32
 
+from flashinfer.utils import get_device_name
+
 _CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float16: cutlass.Float16,
@@ -40,6 +42,13 @@ _CUTLASS_DTYPE = {
 def _validate_balanced_scheduler(is_causal: bool, balanced_scheduler: bool) -> None:
     if balanced_scheduler and not is_causal:
         raise ValueError("balanced_scheduler=True requires is_causal=True")
+
+
+def _use_block_scaled_mma(device: torch.device) -> bool:
+    # GeForce SM120 issues the plain FP8 MMA with FP32 accumulation at half
+    # the rate of the unit-scale kind::mxf8f6f4 form. The RTX PRO 6000 issues
+    # both at the same rate, so other boards keep the plain form.
+    return "GeForce" in get_device_name(device)
 
 
 def _compile_sm120_fmha_fp8_ragged_kernel(
@@ -55,6 +64,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
     with_lse: bool = False,
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
+    block_scaled_mma: bool = False,
 ):
     """Compile one sequence-length-independent packed ragged kernel."""
 
@@ -74,6 +84,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
         q_tile=q_tile,
         use_paged_kv=False,
         balanced_scheduler=balanced_scheduler,
+        block_scaled_mma=block_scaled_mma,
     )
 
     sym_total_q = cute.sym_int()
@@ -160,6 +171,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     enable_skip_softmax: bool = False,
     with_kv_tile_ranges: bool = False,
     gqa_pack_size: int = 1,
+    block_scaled_mma: bool = False,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -180,6 +192,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         num_tokens_per_page=num_tokens_per_page,
         balanced_scheduler=balanced_scheduler,
         gqa_pack_size=gqa_pack_size,
+        block_scaled_mma=block_scaled_mma,
     )
 
     sym_b = cute.sym_int()
@@ -322,12 +335,13 @@ def compile_sm120_fmha_fp8_ragged_kernel(
     device = torch.device(device)
     if torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120")
+    block_scaled_mma = _use_block_scaled_mma(device)
     kernel_name = (
         f"ragged_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
         f"_causal{int(is_causal)}_kt{kv_tile}_qt{q_tile}"
         f"_lse{int(with_lse)}_balanced{int(balanced_scheduler)}"
-        f"_skip{int(enable_skip_softmax)}"
+        f"_skip{int(enable_skip_softmax)}" + ("_mxf8" if block_scaled_mma else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -345,6 +359,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
             with_lse,
             balanced_scheduler,
             enable_skip_softmax,
+            block_scaled_mma,
         ),
         extra_key_files=_cache_key_files(),
     )
@@ -375,6 +390,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     device = torch.device(device)
     if torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120")
+    block_scaled_mma = _use_block_scaled_mma(device)
     kernel_name = (
         f"paged_hnd_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
@@ -384,6 +400,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
         f"_skip{int(enable_skip_softmax)}"
         + ("_kvsplit" if with_kv_tile_ranges else "")
         + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
+        + ("_mxf8" if block_scaled_mma else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -404,6 +421,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
             enable_skip_softmax,
             with_kv_tile_ranges,
             gqa_pack_size,
+            block_scaled_mma,
         ),
         extra_key_files=_cache_key_files(),
     )

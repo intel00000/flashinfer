@@ -79,6 +79,7 @@ def test_skip_softmax_is_exposed_only_by_direct_sm120_apis():
 def test_skip_softmax_has_a_distinct_jit_specialization(monkeypatch):
     pytest.importorskip("cutlass.experimental")
 
+    import flashinfer.cute_dsl.attention.fmha.sm120.compile as compile_module
     from flashinfer.cute_dsl.attention.fmha.sm120.compile import (
         compile_sm120_fmha_fp8_ragged_kernel,
     )
@@ -94,6 +95,7 @@ def test_skip_softmax_has_a_distinct_jit_specialization(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: (12, 0)
     )
+    monkeypatch.setattr(compile_module, "_use_block_scaled_mma", lambda device: False)
     monkeypatch.setattr(
         cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build_and_load
     )
@@ -116,6 +118,72 @@ def test_skip_softmax_has_a_distinct_jit_specialization(monkeypatch):
     assert observed_names[0][1].endswith("_skip0")
     assert observed_names[1][1].endswith("_skip1")
     compile_sm120_fmha_fp8_ragged_kernel.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "device_name,block_scaled",
+    [
+        ("NVIDIA GeForce RTX 5090", True),
+        ("NVIDIA RTX PRO 6000 Blackwell Server Edition", False),
+        ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", False),
+    ],
+)
+def test_block_scaled_mma_is_per_board_with_a_distinct_jit_specialization(
+    monkeypatch, device_name, block_scaled
+):
+    pytest.importorskip("cutlass.experimental")
+
+    import flashinfer.cute_dsl.attention.fmha.sm120.compile as compile_module
+    from flashinfer.jit import cute_dsl_core
+
+    observed = []
+
+    def fake_build_and_load(module_name, kernel_name, compile_fn, **kwargs):
+        observed.append((kernel_name, compile_fn()))
+        return kernel_name
+
+    def fake_compile(*args):
+        return args[-1]
+
+    compile_fns = (
+        compile_module.compile_sm120_fmha_fp8_ragged_kernel,
+        compile_module.compile_sm120_fmha_fp8_paged_kernel,
+    )
+    for compile_fn in compile_fns:
+        compile_fn.cache_clear()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: (12, 0)
+    )
+    monkeypatch.setattr(compile_module, "get_device_name", lambda device: device_name)
+    monkeypatch.setattr(
+        cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build_and_load
+    )
+    monkeypatch.setattr(
+        compile_module, "_compile_sm120_fmha_fp8_ragged_kernel", fake_compile
+    )
+    monkeypatch.setattr(
+        compile_module, "_compile_sm120_fmha_fp8_paged_kernel", fake_compile
+    )
+
+    common = dict(
+        in_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        num_qo_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        is_causal=False,
+        kv_tile=128,
+        q_tile=128,
+        device=torch.device("cuda"),
+    )
+    compile_fns[0](**common)
+    compile_fns[1](**common, num_tokens_per_page=32)
+
+    # The kernel name keys the on-disk cache, which boards may share.
+    assert [name.endswith("_mxf8") for name, _ in observed] == [block_scaled] * 2
+    assert [forwarded for _, forwarded in observed] == [block_scaled] * 2
+    for compile_fn in compile_fns:
+        compile_fn.cache_clear()
 
 
 def test_skip_softmax_threshold_load_follows_pdl_dependency_wait():

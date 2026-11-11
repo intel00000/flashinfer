@@ -691,6 +691,101 @@ def test_sm120_paged_prefill_rejects_nhd_pool():
 
 
 # ---------------------------------------------------------------------------
+# FP8 MMA forms
+# ---------------------------------------------------------------------------
+
+
+def _make_fp8_full_range(shape):
+    """FP8 tensor drawn from every finite E4M3 encoding."""
+    raw = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+    raw[(raw & 0x7F) == 0x7F] -= 1  # 0x7f and 0xff encode NaN
+    return raw.view(torch.float8_e4m3fn)
+
+
+@pytest.fixture
+def force_block_scaled_mma(monkeypatch):
+    """Compile with a chosen FP8 MMA form instead of the board's default."""
+    import flashinfer.cute_dsl.attention.fmha.sm120.compile as compile_module
+
+    def clear_compile_caches():
+        compile_module.compile_sm120_fmha_fp8_ragged_kernel.cache_clear()
+        compile_module.compile_sm120_fmha_fp8_paged_kernel.cache_clear()
+
+    def force(block_scaled):
+        monkeypatch.setattr(
+            compile_module, "_use_block_scaled_mma", lambda device: block_scaled
+        )
+        clear_compile_caches()
+
+    yield force
+    clear_compile_caches()
+
+
+@pytest.mark.parametrize(
+    "storage,is_causal,D,q_len,kv_len",
+    [
+        pytest.param("ragged", True, 64, 65, 2129, id="ragged-d64"),
+        pytest.param("ragged", False, 256, 129, 1920, id="ragged-d256"),
+        pytest.param("paged", True, 128, 65, 2129, id="paged-d128"),
+        pytest.param("paged", False, 256, 129, 1920, id="paged-d256"),
+    ],
+)
+def test_sm120_fp8_mma_forms_are_bitwise_identical(
+    storage, is_causal, D, q_len, kv_len, force_block_scaled_mma
+):
+    """The plain FP8 ``mma.sync`` form and the ``kind::mxf8f6f4`` form with unit
+    UE8M0 scales (the GeForce dispatch) accumulate the same products in FP32."""
+    Hq, Hkv, page_size = 4, 2, 32
+    # Full-range operands round in the FP32 accumulators; keep scores O(1).
+    sm_scale = 1.0 / (16.0 * 448.0 * math.sqrt(D))
+    q = _make_fp8_full_range((q_len, Hq, D))
+    k = _make_fp8_full_range((kv_len, Hkv, D))
+    v = _make_fp8_full_range((kv_len, Hkv, D))
+    cu_q = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
+    num_pages = (kv_len + page_size - 1) // page_size
+    # Logical page i lives in physical page num_pages - 1 - i.
+    block_tables = torch.arange(num_pages, device="cuda", dtype=torch.int32)
+    block_tables = block_tables.flip(0).unsqueeze(0)
+    k_pool = torch.zeros(num_pages, Hkv, page_size, D, device="cuda", dtype=q.dtype)
+    v_pool = torch.zeros_like(k_pool)
+    for pool, tokens in ((k_pool, k), (v_pool, v)):
+        for logical_page, page in enumerate(tokens.split(page_size)):
+            pool[num_pages - 1 - logical_page, :, : page.shape[0]].copy_(
+                page.transpose(0, 1)
+            )
+    seqlens_kv = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+
+    def run(block_scaled):
+        force_block_scaled_mma(block_scaled)
+        o = torch.empty_like(q, dtype=torch.float16)
+        lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+        common = dict(
+            max_seqlen_q=q_len, is_causal=is_causal, sm_scale=sm_scale, lse=lse
+        )
+        if storage == "ragged":
+            sm120_fmha_fp8_ragged_prefill(q, k, v, o, cu_q, cu_k, **common)
+        else:
+            sm120_fmha_fp8_paged_prefill(
+                q, k_pool, v_pool, o, block_tables, seqlens_kv, cu_q, **common
+            )
+        return o, lse
+
+    plain, plain_lse = run(False)
+    block_scaled, block_scaled_lse = run(True)
+    assert torch.equal(plain.view(torch.int16), block_scaled.view(torch.int16))
+    assert torch.equal(plain_lse.view(torch.int32), block_scaled_lse.view(torch.int32))
+
+    ref, ref_lse = _ref_fmha_and_lse(
+        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), sm_scale, is_causal
+    )
+    # FP8 P quantization on full-range V exceeds the element-wise tolerance.
+    err = torch.linalg.vector_norm(plain.float() - ref[0])
+    assert err < 0.05 * torch.linalg.vector_norm(ref[0])
+    torch.testing.assert_close(plain_lse, ref_lse[0], atol=2e-3, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 
