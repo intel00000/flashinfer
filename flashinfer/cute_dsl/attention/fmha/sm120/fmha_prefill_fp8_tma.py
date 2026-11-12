@@ -181,11 +181,11 @@ def ptx_mma_m16n8k32_f32(
     c2: cutlass.Float32,
     c3: cutlass.Float32,
     ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    block_scaled: cutlass.Constexpr[bool],
+    unit_scale: cutlass.Constexpr[bool],
 ) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
     """``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32``.
 
-    ``block_scaled`` selects the ``kind::mxf8f6f4`` form with unit UE8M0
+    ``unit_scale`` selects the ``kind::mxf8f6f4`` form with unit UE8M0
     scales, which is bitwise identical.
     """
     if cutlass.const_expr(ab_dtype != cutlass.Float8E4M3FN):
@@ -194,7 +194,7 @@ def ptx_mma_m16n8k32_f32(
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"
         " {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};"
     )
-    if cutlass.const_expr(block_scaled):
+    if cutlass.const_expr(unit_scale):
         ptx = (
             "{\n"
             "  .reg .b32 sf;\n"
@@ -375,7 +375,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         num_tokens_per_page: int | None = None,
         balanced_scheduler: bool = False,
         gqa_pack_size: int = 1,
-        block_scaled_mma: bool = False,
+        fp8_unit_scale_mma: bool = False,
     ) -> None:
         """Initialize the FMHA prefill kernel configuration.
 
@@ -392,7 +392,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             that causal masking is enabled when this option is true.
         :param gqa_pack_size: Q heads sharing one K/V head packed into each Q
             tile (row ``r`` is token ``r // gqa_pack_size``). Must divide ``q_tile``.
-        :param block_scaled_mma: Issue the FP8 MMAs in the ``kind::mxf8f6f4``
+        :param fp8_unit_scale_mma: Issue the FP8 MMAs in the ``kind::mxf8f6f4``
             form with unit scales. The result is bitwise identical; GeForce
             SM120 runs the plain FP32-accumulating form at half the rate.
         """
@@ -406,7 +406,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         self.is_causal = is_causal
         self.use_paged_kv = use_paged_kv
         self.balanced_scheduler = balanced_scheduler
-        self.block_scaled_mma = block_scaled_mma
+        self.fp8_unit_scale_mma = fp8_unit_scale_mma
         # All causal paths use bottom-right alignment, so Q is positioned at
         # the end of its logical K/V sequence when their lengths differ.
         self.has_causal_q_offset = self.is_causal
@@ -992,7 +992,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     s_regs[s_off + 2],
                     s_regs[s_off + 3],
                     self.in_dtype,
-                    self.block_scaled_mma,
+                    self.fp8_unit_scale_mma,
                 )
             k_cur = k_next
 
@@ -1061,7 +1061,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         s_regs[s_off + 2],
                         s_regs[s_off + 3],
                         self.in_dtype,
-                        self.block_scaled_mma,
+                        self.fp8_unit_scale_mma,
                     )
                 # On the final head-dimension fragment, reduce the preceding
                 # score block while this block's independent MMA results are
@@ -1669,7 +1669,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         o_regs[o_off + 2],
                         o_regs[o_off + 3],
                         self.in_dtype,
-                        self.block_scaled_mma,
+                        self.fp8_unit_scale_mma,
                     )
             if cutlass.const_expr(prefetch_next):
                 v_cur = v_next
@@ -1877,7 +1877,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         o_regs[o_off + 2],
                         o_regs[o_off + 3],
                         self.in_dtype,
-                        self.block_scaled_mma,
+                        self.fp8_unit_scale_mma,
                     )
                 for pair_in_block in cutlass.range_constexpr(1):
                     d_pair = d_block + pair_in_block
